@@ -126,7 +126,7 @@ JSON structure required:
         'anthropic-beta':  'mcp-client-2025-04-04',
       },
       body: JSON.stringify({
-        model:      'claude-sonnet-4-20250514',
+        model:      'claude-sonnet-4-6',
         max_tokens: 2000,
         system:     systemPrompt,
         messages: [{ role: 'user', content: `Fetch Zoho Books org ${orgId} financial data for period ${from} to ${to}. Return only the JSON object, nothing else.` }],
