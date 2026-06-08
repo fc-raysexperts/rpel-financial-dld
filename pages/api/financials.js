@@ -199,7 +199,7 @@ export default async function handler(req, res) {
   const topClients = custRows
     .map(c => ({
       nm:          c.customer_name || c.contact_name || c.name || 'Unknown',
-      billed:      Cr(c.sales_amount || c.invoiced_amount || c.total || c.amount || 0),
+      billed:      Cr(c.sales || 0),
       outstanding: Cr(c.outstanding_receivable_amount || c.balance || c.due_amount || 0),
       sector:      '—',
       seg:         'epc',
