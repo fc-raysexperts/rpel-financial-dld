@@ -1,18 +1,17 @@
 // pages/api/financials.js
-// Calls Zoho Books REST API directly — no MCP needed, fully reliable
+// Built from actual Zoho Books API response structure — verified from debug output
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { fy = '27', period = 'annual' } = req.body || {};
 
-  // Build date range
   const fyStart = parseInt(fy) - 1 + 2000;
   const ranges = {
-    annual: { from: `${fyStart}-04-01`, to: `${fyStart + 1}-03-31` },
-    q1:     { from: `${fyStart}-04-01`, to: `${fyStart}-06-30` },
-    q2:     { from: `${fyStart}-07-01`, to: `${fyStart}-09-30` },
-    q3:     { from: `${fyStart}-10-01`, to: `${fyStart}-12-31` },
+    annual: { from: `${fyStart}-04-01`,     to: `${fyStart + 1}-03-31` },
+    q1:     { from: `${fyStart}-04-01`,     to: `${fyStart}-06-30` },
+    q2:     { from: `${fyStart}-07-01`,     to: `${fyStart}-09-30` },
+    q3:     { from: `${fyStart}-10-01`,     to: `${fyStart}-12-31` },
     q4:     { from: `${fyStart + 1}-01-01`, to: `${fyStart + 1}-03-31` },
   };
   const { from, to } = ranges[period] || ranges.annual;
@@ -38,199 +37,272 @@ export default async function handler(req, res) {
     return res.status(500).json({ ok: false, error: `Zoho auth failed: ${e.message}` });
   }
 
-  const zbHeaders = {
+  const zbH = {
     'Authorization': `Zoho-oauthtoken ${token}`,
     'X-com-zoho-books-organizationid': orgId,
   };
   const base = 'https://www.zohoapis.in/books/v3';
+  // Values from Zoho are in rupees — divide by 1 crore
+  const Cr = v => Math.round((parseFloat(v) || 0) / 10000000 * 100) / 100;
 
   // ── Step 2: Fetch all reports in parallel ─────────────────────────────────
+  let pl, bs, cf, cust, ar, ap;
   try {
-    const [plRes, bsRes, cfRes, custRes, arRes, apRes] = await Promise.all([
-      // P&L
-      fetch(`${base}/reports/profitandloss?from_date=${from}&to_date=${to}&cash_based=false`, { headers: zbHeaders }),
-      // Balance Sheet
-      fetch(`${base}/reports/balancesheet?date=${to}&cash_based=false`, { headers: zbHeaders }),
-      // Cash Flow
-      fetch(`${base}/reports/cashflow?from_date=${from}&to_date=${to}`, { headers: zbHeaders }),
-      // Sales by Customer (top 25)
-      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=25&sort_column=sales_amount&sort_order=D`, { headers: zbHeaders }),
-      // AR Aging
-      fetch(`${base}/reports/agedreceivables?date=${to}`, { headers: zbHeaders }),
-      // AP Aging
-      fetch(`${base}/reports/agedpayables?date=${to}`, { headers: zbHeaders }),
+    const [plR, bsR, cfR, custR, arR, apR] = await Promise.all([
+      fetch(`${base}/reports/profitandloss?from_date=${from}&to_date=${to}&cash_based=false`, { headers: zbH }),
+      fetch(`${base}/reports/balancesheet?date=${to}&cash_based=false`, { headers: zbH }),
+      fetch(`${base}/reports/cashflow?from_date=${from}&to_date=${to}`, { headers: zbH }),
+      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=25&sort_column=sales_amount&sort_order=D`, { headers: zbH }),
+      fetch(`${base}/reports/agedreceivables?date=${to}`, { headers: zbH }),
+      fetch(`${base}/reports/agedpayables?date=${to}`, { headers: zbH }),
     ]);
-
-    const [pl, bs, cf, cust, ar, ap] = await Promise.all([
-      plRes.json(), bsRes.json(), cfRes.json(),
-      custRes.json(), arRes.json(), apRes.json(),
+    [pl, bs, cf, cust, ar, ap] = await Promise.all([
+      plR.json(), bsR.json(), cfR.json(), custR.json(), arR.json(), apR.json(),
     ]);
-
-    // ── Step 3: Parse P&L ─────────────────────────────────────────────────
-    const Cr = v => Math.round((parseFloat(v) || 0) / 100000 * 100) / 100;
-    const findPL = (data, ...names) => {
-      const rows = data?.profitandloss?.report_rows || [];
-      const flat = [];
-      const walk = (arr) => arr.forEach(r => { flat.push(r); if (r.child_row) walk(r.child_row); });
-      walk(rows);
-      for (const nm of names) {
-        const hit = flat.find(r => (r.label || '').toLowerCase().includes(nm.toLowerCase()));
-        if (hit) return Cr(hit.total || hit.amount || 0);
-      }
-      return 0;
-    };
-
-    const rev      = findPL(pl, 'revenue from operations', 'operating income');
-    const cogsMain = findPL(pl, 'cost of goods sold', 'cogs');
-    const modules  = findPL(pl, 'modules');
-    const mms      = findPL(pl, 'mms');
-    const cogsOpex = findPL(pl, 'operating expenses', '4-02');
-    const cogs     = Math.round((cogsMain + modules + mms + cogsOpex) * 100) / 100;
-    const gp       = Math.round((rev - cogs) * 100) / 100;
-    const gpM      = rev ? Math.round(gp / rev * 10000) / 100 : 0;
-    const admin    = findPL(pl, 'administrative expenses', '4-06');
-    const empBen   = findPL(pl, 'employee benefits expense', '4-03');
-    const empWages = findPL(pl, 'employees benefit expenses', 'salary');
-    const fin      = findPL(pl, 'finance costs', '4-04');
-    const taxExp   = findPL(pl, 'tax expenses', '4-07');
-    const pat      = findPL(pl, 'net profit', 'net loss', 'profit after tax');
-    const ebit     = Math.round((gp - admin - empBen - empWages - fin - taxExp) * 100) / 100;
-    const ebitM    = rev ? Math.round(ebit / rev * 10000) / 100 : 0;
-    const ebitda   = Math.round((ebit + fin) * 100) / 100;
-    const ebitdaM  = rev ? Math.round(ebitda / rev * 10000) / 100 : 0;
-    const patM     = rev ? Math.round(pat / rev * 10000) / 100 : 0;
-
-    // ── Step 4: Parse Balance Sheet ───────────────────────────────────────
-    const findBS = (data, ...names) => {
-      const sections = data?.balance_sheet?.report_rows || [];
-      const flat = [];
-      const walk = (arr) => arr.forEach(r => { flat.push(r); if (r.child_row) walk(r.child_row); });
-      walk(sections);
-      for (const nm of names) {
-        const hit = flat.find(r => (r.label || '').toLowerCase().includes(nm.toLowerCase()));
-        if (hit) return Cr(hit.total || hit.amount || 0);
-      }
-      return 0;
-    };
-
-    const rec          = findBS(bs, 'trade receivables', 'accounts receivable');
-    const advCred      = findBS(bs, 'advance to creditors');
-    const fdr          = findBS(bs, 'fixed deposits');
-    const inventory    = findBS(bs, 'inventories', 'inventory asset');
-    const cwip         = findBS(bs, 'capital work in progress', 'cwip');
-    const intangUdev   = findBS(bs, 'intangible asset under development');
-    const fixedAssets  = findBS(bs, 'plant & machinery', 'property, plant');
-    const totalCurA    = findBS(bs, 'total current assets', 'total for current assets');
-    const totalAssets  = findBS(bs, 'total assets', 'total for assets');
-    const tradePay     = findBS(bs, 'trade payables', 'accounts payable');
-    const advDebtor    = findBS(bs, 'advance from debtors');
-    const gstPay       = findBS(bs, 'gst payable');
-    const statLiab     = findBS(bs, 'statutory liabilities');
-    const retMoney     = findBS(bs, 'retention money');
-    const secLoan      = findBS(bs, 'secured loan');
-    const prov         = findBS(bs, 'provisions');
-    const totalCurL    = findBS(bs, 'total current liabilities', 'total for current liabilities');
-    const totalLiab    = findBS(bs, 'total liabilities', 'total for liabilities');
-    const shareCap     = findBS(bs, 'equity share capital', 'share capital');
-    const secPrem      = findBS(bs, 'securities premium');
-    const retained     = findBS(bs, 'retained earnings');
-    const currEarn     = findBS(bs, 'current year earnings', 'net profit');
-    const nw           = Math.round((shareCap + secPrem + retained + currEarn) * 100) / 100;
-
-    // Bank accounts from BS
-    const bsFlat = [];
-    const walkBS = (arr) => arr.forEach(r => { bsFlat.push(r); if (r.child_row) walkBS(r.child_row); });
-    walkBS(bs?.balance_sheet?.report_rows || []);
-    const bankRows = bsFlat.filter(r => {
-      const l = (r.label || '').toLowerCase();
-      return l.includes('bank') || l.includes('cash credit') || l.includes('overdraft') || l.includes('current a/c');
-    });
-    const banks = bankRows.slice(0, 10).map(r => {
-      const l = r.label || '';
-      const bal = Cr(r.total || r.amount || 0);
-      const type = l.toLowerCase().includes('cash credit') ? 'cc' : l.toLowerCase().includes('overdraft') ? 'od' : 'current';
-      return { name: l, num: (l.match(/\d{6,}/)?.[0] || '').slice(-6), bal, type };
-    });
-    const cashGross = banks.filter(b => b.bal > 0).reduce((s, b) => s + b.bal, 0);
-    const ccDrawn   = Math.abs(banks.find(b => b.type === 'cc')?.bal || 0);
-    const debt      = Math.round((ccDrawn + secLoan) * 100) / 100;
-    const gearing   = nw ? Math.round(debt / nw * 10000) / 10000 : 0;
-    const cr        = totalCurL ? Math.round(totalCurA / totalCurL * 100) / 100 : 0;
-    const ic        = fin > 0 ? Math.round(ebit / fin * 10) / 10 : 99;
-
-    // ── Step 5: Parse Cash Flow ───────────────────────────────────────────
-    const findCF = (data, ...names) => {
-      const rows = data?.cash_flow?.report_rows || [];
-      const flat = [];
-      const walk = (arr) => arr.forEach(r => { flat.push(r); if (r.child_row) walk(r.child_row); });
-      walk(rows);
-      for (const nm of names) {
-        const hit = flat.find(r => (r.label || '').toLowerCase().includes(nm.toLowerCase()));
-        if (hit) return Cr(hit.total || hit.amount || 0);
-      }
-      return 0;
-    };
-    const opCF  = findCF(cf, 'operating activities', 'net cash provided by operating');
-    const invCF = findCF(cf, 'investing activities', 'net cash provided by investing');
-    const begCF = findCF(cf, 'beginning cash', 'opening balance');
-    const endCF = findCF(cf, 'ending cash', 'closing balance');
-
-    // ── Step 6: Parse Customers ───────────────────────────────────────────
-    const custRows = cust?.sales_by_customer || cust?.report_rows || [];
-    const days = Math.round((new Date(to) - new Date(from)) / 86400000);
-    const topClients = custRows.slice(0, 10).map(c => ({
-      nm:          c.customer_name || c.label || 'Unknown',
-      billed:      Cr(c.sales_amount || c.total || 0),
-      outstanding: Cr(c.outstanding_receivable_amount || c.balance || 0),
-      sector:      '—',
-      seg:         'epc',
-    }));
-    const debtorDays  = rev && days ? Math.round(rec / (rev / days)) : 0;
-    const credDays    = cogs && days ? Math.round(tradePay / (cogs / days)) : 0;
-
-    // ── Step 7: Parse AR/AP Aging ─────────────────────────────────────────
-    const parseAging = (data, key) => {
-      const rows = data?.[key]?.report_rows || data?.report_rows || [];
-      const flat = [];
-      const walk = (arr) => arr.forEach(r => { flat.push(r); if (r.child_row) walk(r.child_row); });
-      walk(rows);
-      const tot = flat.find(r => (r.label || '').toLowerCase().includes('total'));
-      return {
-        '0_30':    Cr(tot?.columns?.[0]?.amount || 0),
-        '31_60':   Cr(tot?.columns?.[1]?.amount || 0),
-        '61_90':   Cr(tot?.columns?.[2]?.amount || 0),
-        '90_plus': Cr(tot?.columns?.[3]?.amount || 0),
-      };
-    };
-    const arAging = parseAging(ar, 'aged_receivables');
-    const apAging = parseAging(ap, 'aged_payables');
-
-    // ── Return final JSON ─────────────────────────────────────────────────
-    return res.status(200).json({
-      ok: true,
-      fetchedAt: new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }),
-      from, to,
-      data: {
-        rev, cogs, cogs_main: cogsMain, modules, mms, cogs_opex: cogsOpex,
-        gp, gp_m: gpM, admin, emp_ben: empBen, emp_wages: empWages,
-        fin, tax_exp: taxExp, ebit, ebit_m: ebitM, ebitda, ebitda_m: ebitdaM,
-        pat, pat_m: patM,
-        cash_gross: cashGross, cc_drawn: ccDrawn, fdr, rec, adv_cred: advCred,
-        inventory, cwip, intang_udev: intangUdev, fixed_assets: fixedAssets,
-        total_cur_assets: totalCurA, total_assets: totalAssets,
-        trade_pay: tradePay, adv_debtor: advDebtor, gst_pay: gstPay,
-        stat_liab: statLiab, ret_money: retMoney, sec_loan: secLoan, prov,
-        total_cur_liab: totalCurL, total_liab: totalLiab,
-        share_cap: shareCap, sec_prem: secPrem, retained, curr_earn: currEarn, nw,
-        debt, gearing, cr, ic,
-        op_cf: opCF, inv_cf: invCF, beg_cf: begCF, end_cf: endCF,
-        debtor_days: debtorDays, creditor_days: credDays,
-        banks, top_clients: topClients, ar_aging: arAging, ap_aging: apAging,
-      },
-    });
-
   } catch (e) {
-    console.error('ZB fetch error:', e.message);
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: `ZB fetch failed: ${e.message}` });
   }
+
+  // ── Step 3: Parse P&L ─────────────────────────────────────────────────────
+  // Structure: profit_and_loss[] → each item has .name and .account_transactions[]
+  // account_transactions[] → each has .name and .total (in rupees)
+  const plSections = pl.profit_and_loss || [];
+
+  // Flatten all account_transactions across all sections into one lookup map
+  const plMap = {};
+  const plSectionMap = {};
+  for (const section of plSections) {
+    plSectionMap[section.name] = section.total;
+    for (const tx of section.account_transactions || []) {
+      // Some sections have nested account_transactions inside account_transactions
+      for (const item of tx.account_transactions || [tx]) {
+        const key = (item.name || '').trim();
+        if (key) plMap[key] = (plMap[key] || 0) + (parseFloat(item.total) || 0);
+      }
+    }
+  }
+
+  // Revenue = Total Operating Income (from the Gross Profit section's first account_transactions)
+  const gpSection = plSections.find(s => s.name === 'Gross Profit');
+  const opIncomeSection = (gpSection?.account_transactions || []).find(t => t.name === 'Operating Income');
+  const cogsSection     = (gpSection?.account_transactions || []).find(t => t.name === 'Cost of Goods Sold');
+
+  const rev = Cr(opIncomeSection?.total || 0);
+
+  // Revenue sub-components
+  const salesGoods   = Cr(plMap['Sales GM-Supply of Goods'] || 0);
+  const salesService = Cr(plMap['Sales GM-Supply of Service'] || 0);
+  const omIncome     = Cr(plMap['Operation & Maintenance Income'] || 0);
+  const leaseIncome  = Cr(plMap['Lease Rental Income'] || 0);
+
+  // COGS components
+  const cogsMain  = Cr((plMap['Consumption- Project Material GM'] || 0) + (plMap['Consumption- Stores & Consumables'] || 0) + (plMap['Cost of Goods Sold'] || 0));
+  const modules   = Cr(plMap['Modules'] || 0);
+  const mms       = Cr(plMap['MMS'] || 0);
+  const cogsOpex  = Cr(
+    (plMap['Civil Work GM'] || 0) +
+    (plMap['Erection & Installation Work-GM'] || 0) +
+    (plMap['Freight Inward Expenses'] || 0) +
+    (plMap['Consultancy & Technical Fees Project GM'] || 0) +
+    (plMap['Module Washing Expenses'] || 0) +
+    (plMap['Security Manpower Expenses_1'] || 0) +
+    (plMap['Land Lease Registration Expense'] || 0) +
+    (plMap['Project Approval/ Government Fees'] || 0)
+  );
+  const cogs = Cr(cogsSection?.total || 0);
+  const gp   = Cr(gpSection?.total || 0);
+  const gpM  = rev ? Math.round(gp / rev * 10000) / 100 : 0;
+
+  // Operating expenses
+  const fin      = Cr((plMap['Interest on Bank Overdraft & Cash Credit'] || 0) + (plMap['Bank Charges'] || 0) + (plMap['Interest on Car Loan'] || 0));
+  const empBen   = Cr((plMap['EPF Employer Contribution'] || 0) + (plMap['ESI Employer Contribution'] || 0) + (plMap['Staff Welfare Expense'] || 0));
+  const empWages = Cr((plMap['Salary-Jaipur'] || 0) + (plMap['Salaries and Employee Wages'] || 0));
+  const admin    = Cr(
+    (plMap['Legal & Professional Charges'] || 0) +
+    (plMap['Software Expenses'] || 0) +
+    (plMap['Office Expenses'] || 0) +
+    (plMap['Tour & Travelling Expenses'] || 0) +
+    (plMap['Vehicle Running & Maintenance'] || 0) +
+    (plMap['Electricity Expenses'] || 0) +
+    (plMap['Internet Expenses'] || 0) +
+    (plMap['Insurance Expenses'] || 0) +
+    (plMap['Marketing & Advertisement Expenses'] || 0) +
+    (plMap['Printing & Stationery Expenses'] || 0) +
+    (plMap['Auditor Remuneration'] || 0)
+  );
+  const taxExp = Cr(plMap['Income Tax of Earlier Years'] || 0);
+
+  // Section totals
+  const opProfitSection = plSections.find(s => s.name === 'Operating Profit');
+  const netProfitSection = plSections.find(s => s.name === 'Net Profit/Loss');
+
+  const ebit    = Cr(opProfitSection?.total || 0);
+  const ebitM   = rev ? Math.round(ebit / rev * 10000) / 100 : 0;
+  const ebitda  = Math.round((ebit + fin) * 100) / 100;
+  const ebitdaM = rev ? Math.round(ebitda / rev * 10000) / 100 : 0;
+  const pat     = Cr(netProfitSection?.total || 0);
+  const patM    = rev ? Math.round(pat / rev * 10000) / 100 : 0;
+
+  // ── Step 4: Parse Balance Sheet ───────────────────────────────────────────
+  // Flatten all BS rows recursively into a name→value map
+  const bsMap = {};
+  const bsRows = bs.balance_sheet || bs.Balance_Sheet || [];
+  const walkBS = (rows) => {
+    for (const row of (rows || [])) {
+      const key = (row.account_name || row.name || row.label || '').trim();
+      if (key) bsMap[key] = parseFloat(row.balance || row.total || row.amount || 0);
+      if (row.subaccounts)   walkBS(row.subaccounts);
+      if (row.child_row)     walkBS(row.child_row);
+      if (row.account_transactions) walkBS(row.account_transactions);
+    }
+  };
+  walkBS(Array.isArray(bsRows) ? bsRows : [bsRows]);
+
+  // Also walk the sections array if present
+  const bsSections = bs.balance_sheet_report?.balance_sheet || bs.balance_sheet || [];
+  if (Array.isArray(bsSections)) walkBS(bsSections);
+
+  const getBs = (...names) => {
+    for (const nm of names) {
+      const key = Object.keys(bsMap).find(k => k.toLowerCase().includes(nm.toLowerCase()));
+      if (key && bsMap[key]) return Cr(Math.abs(bsMap[key]));
+    }
+    return 0;
+  };
+
+  // Use known exact account names from your ZB (from the Excel we read earlier)
+  const rec         = getBs('Trade Receivables-Domestic', 'Trade receivables', 'Accounts Receivable');
+  const advCred     = getBs('Advance to Creditors');
+  const fdr         = getBs('Fixed Deposits');
+  const inventory   = getBs('Inventories - Project Material GM', 'Inventory Asset');
+  const cwip        = getBs('Capital Work in Progress');
+  const intangUdev  = getBs('Intangible Asset Under Development');
+  const tradePay    = getBs('Trade Payables', 'Accounts Payable');
+  const advDebtor   = getBs('Advance from debtors');
+  const gstPay      = getBs('GST Payable');
+  const statLiab    = getBs('Statutory Liabilities');
+  const retMoney    = getBs('Retention Money Payable');
+  const secLoan     = getBs('Secured Loan');
+  const prov        = getBs('Provisions');
+  const shareCap    = getBs('Equity Share Capital');
+  const secPrem     = getBs('Securities Premium');
+  const retained    = getBs('Retained Earnings');
+  const currEarn    = getBs('Current Year Earnings');
+  const nw          = Math.round((shareCap + secPrem + retained + currEarn) * 100) / 100 || getBs('Total Equity', 'Total for Equities');
+
+  // Bank accounts — find CC and all current accounts
+  const ccKey    = Object.keys(bsMap).find(k => k.includes('Cash Credit'));
+  const ccDrawn  = ccKey ? Cr(Math.abs(bsMap[ccKey])) : 0;
+  const banks    = Object.entries(bsMap)
+    .filter(([k]) => k.includes('Bank') || k.includes('Cash Credit') || k.includes('Current A/c') || k.includes('Overdraft'))
+    .map(([name, val]) => ({
+      name,
+      num:  (name.match(/\d{6,}/)?.[0] || '').slice(-6),
+      bal:  Cr(val),
+      type: name.includes('Cash Credit') ? 'cc' : name.includes('Overdraft') ? 'od' : 'current',
+    }))
+    .filter(b => Math.abs(b.bal) > 0);
+
+  const cashGross = banks.filter(b => b.bal > 0).reduce((s, b) => s + b.bal, 0);
+  const debt      = Math.round((ccDrawn + secLoan) * 100) / 100;
+  const gearing   = nw ? Math.round(debt / nw * 10000) / 10000 : 0;
+
+  // Try to get total current assets/liabilities from BS totals
+  const totalCurA  = getBs('Total Current Assets', 'Total for Current Assets') || (rec + advCred + fdr + inventory + cashGross);
+  const totalCurL  = getBs('Total Current Liabilities', 'Total for Current Liabilities') || (tradePay + advDebtor + gstPay + statLiab + ccDrawn + retMoney + prov);
+  const totalAssets = getBs('Total Assets', 'Total for Assets') || (totalCurA + cwip + intangUdev);
+  const totalLiab   = getBs('Total Liabilities', 'Total for Liabilities') || totalCurL;
+  const cr          = totalCurL ? Math.round(totalCurA / totalCurL * 100) / 100 : 0;
+  const ic          = fin > 0 ? Math.round(ebit / fin * 10) / 10 : 99;
+
+  // ── Step 5: Parse Cash Flow ───────────────────────────────────────────────
+  const cfRows = cf.cash_flow || [];
+  const cfMap  = {};
+  const walkCF = (rows) => {
+    for (const row of (rows || [])) {
+      const key = (row.account_name || row.name || row.label || '').trim();
+      if (key) cfMap[key] = parseFloat(row.total || row.balance || row.amount || 0);
+      if (row.subaccounts)          walkCF(row.subaccounts);
+      if (row.child_row)            walkCF(row.child_row);
+      if (row.account_transactions) walkCF(row.account_transactions);
+    }
+  };
+  walkCF(Array.isArray(cfRows) ? cfRows : [cfRows]);
+
+  const getCF = (...names) => {
+    for (const nm of names) {
+      const key = Object.keys(cfMap).find(k => k.toLowerCase().includes(nm.toLowerCase()));
+      if (key) return Cr(cfMap[key]);
+    }
+    return 0;
+  };
+  const opCF  = getCF('Net cash provided by Operating', 'Operating Activities');
+  const invCF = getCF('Net cash provided by Investing', 'Investing Activities');
+  const begCF = getCF('Beginning Cash Balance', 'Opening Balance');
+  const endCF = getCF('Ending Cash Balance', 'Closing Balance');
+
+  // ── Step 6: Parse Customers ───────────────────────────────────────────────
+  const custRows   = cust?.sales_by_customer || cust?.report_rows || [];
+  const days       = Math.max(1, Math.round((new Date(to) - new Date(from)) / 86400000));
+  const topClients = custRows.slice(0, 10).map(c => ({
+    nm:          c.customer_name || c.contact_name || c.name || 'Unknown',
+    billed:      Cr(c.sales_amount || c.invoiced_amount || c.total || 0),
+    outstanding: Cr(c.outstanding_receivable_amount || c.balance || 0),
+    sector:      '—',
+    seg:         'epc',
+  })).filter(c => c.billed > 0);
+
+  const debtorDays = rev && days ? Math.round(rec / (rev / days)) : 0;
+  const credDays   = cogs && days ? Math.round(tradePay / (cogs / days)) : 0;
+
+  // ── Step 7: Parse AR/AP Aging ─────────────────────────────────────────────
+  const parseAging = (data, key1, key2) => {
+    const rows = data?.[key1] || data?.[key2] || data?.report_rows || [];
+    const flat = [];
+    const walk = (arr) => { for (const r of (arr || [])) { flat.push(r); walk(r.child_row); walk(r.account_transactions); } };
+    walk(Array.isArray(rows) ? rows : [rows]);
+    // Look for a total/summary row
+    const tot = flat.find(r => (r.name || r.label || '').toLowerCase().includes('total')) || flat[flat.length - 1] || {};
+    const cols = tot.columns || tot.aging_details || [];
+    return {
+      '0_30':    Cr(cols[0]?.amount || cols[0]?.total || 0),
+      '31_60':   Cr(cols[1]?.amount || cols[1]?.total || 0),
+      '61_90':   Cr(cols[2]?.amount || cols[2]?.total || 0),
+      '90_plus': Cr(cols[3]?.amount || cols[3]?.total || 0),
+    };
+  };
+  const arAging = parseAging(ar, 'aged_receivables', 'ar_aging');
+  const apAging = parseAging(ap, 'aged_payables',    'ap_aging');
+
+  // ── Return ─────────────────────────────────────────────────────────────────
+  return res.status(200).json({
+    ok: true,
+    fetchedAt: new Date().toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }),
+    from, to,
+    data: {
+      // P&L
+      rev, cogs, cogs_main: cogsMain, modules, mms, cogs_opex: cogsOpex,
+      gp, gp_m: gpM,
+      admin, emp_ben: empBen, emp_wages: empWages, fin, tax_exp: taxExp,
+      ebit, ebit_m: ebitM, ebitda, ebitda_m: ebitdaM, pat, pat_m: patM,
+      // Balance Sheet
+      cash_gross: cashGross, cc_drawn: ccDrawn, fdr, rec, adv_cred: advCred,
+      inventory, cwip, intang_udev: intangUdev,
+      total_cur_assets: totalCurA, total_assets: totalAssets,
+      trade_pay: tradePay, adv_debtor: advDebtor, gst_pay: gstPay,
+      stat_liab: statLiab, ret_money: retMoney, sec_loan: secLoan, prov,
+      total_cur_liab: totalCurL, total_liab: totalLiab,
+      share_cap: shareCap, sec_prem: secPrem, retained, curr_earn: currEarn, nw,
+      debt, gearing, cr, ic,
+      // Cash Flow
+      op_cf: opCF, inv_cf: invCF, beg_cf: begCF, end_cf: endCF,
+      // Derived
+      debtor_days: debtorDays, creditor_days: credDays,
+      // Live data
+      banks, top_clients: topClients, ar_aging: arAging, ap_aging: apAging,
+      // Revenue breakdown
+      sales_goods: salesGoods, sales_service: salesService,
+      om_income: omIncome, lease_income: leaseIncome,
+    },
+  });
 }
