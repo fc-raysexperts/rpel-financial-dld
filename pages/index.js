@@ -523,16 +523,29 @@ export default function RPELDLD() {
             ))}</tbody>
           </table>
         </div>
-        {d.ar_aging && (
-          <>
-            <div className="sh">AR aging summary</div>
-            <div className="g4">
-              {[['0–30 days', d.ar_aging['0_30'], 'tg-g'], ['31–60 days', d.ar_aging['31_60'], 'tg-a'], ['61–90 days', d.ar_aging['61_90'], 'tg-a'], ['90+ days', d.ar_aging['90_plus'], 'tg-r']].map(([lbl, val, tc]) => (
-                <div key={lbl} className="mc"><div className="mc-l">{lbl}</div><div className="mc-v">{C(val)}</div><div className="mc-s"><span className={`tg ${tc}`}>{lbl}</span></div></div>
-              ))}
-            </div>
-          </>
-        )}
+        <div className="sh">Receivables health — {pLabel()}</div>
+        <div className="g4">
+          {(() => {
+            const totalOutstanding = (d.top_clients || []).reduce((s, c) => s + sN(c.outstanding), 0);
+            const totalBilled      = (d.top_clients || []).reduce((s, c) => s + sN(c.billed), 0);
+            const collectionPct    = totalBilled > 0 ? Math.round((totalBilled - totalOutstanding) / totalBilled * 100) : 0;
+            const dDays            = sN(d.debtor_days || d.debtorDays, 67);
+            const top1Pct          = d.rev && (d.top_clients || [])[0] ? Math.round(sN((d.top_clients || [])[0].billed) / d.rev * 100) : 0;
+            const top3Pct          = d.rev ? Math.round((d.top_clients || []).slice(0,3).reduce((s,c) => s + sN(c.billed), 0) / d.rev * 100) : 0;
+            return [
+              { lbl: 'Total Outstanding', val: C(totalOutstanding), sub: 'Live from ZB customer balances', cls: totalOutstanding > 100 ? 'wa' : '' },
+              { lbl: 'Debtor Days', val: `${dDays}d`, sub: `CRISIL trigger <90d`, cls: dDays <= 90 ? 'up' : 'wa' },
+              { lbl: 'Top Client Concentration', val: `${top1Pct}%`, sub: `${(d.top_clients||[])[0]?.nm?.split(' ')[0] || '—'} of revenue`, cls: top1Pct > 30 ? 'wa' : '' },
+              { lbl: 'Top 3 Concentration', val: `${top3Pct}%`, sub: 'Top 3 clients of revenue', cls: top3Pct > 60 ? 'wa' : '' },
+            ].map(({ lbl, val, sub, cls }) => (
+              <div key={lbl} className="mc">
+                <div className="mc-l">{lbl}</div>
+                <div className={`mc-v ${cls}`}>{val}</div>
+                <div className="mc-s">{sub}</div>
+              </div>
+            ));
+          })()}
+        </div>
         <div className="sh">Supplier concentration — Waaree risk</div>
         <div className="alrt amber"><div className="alrt-dot"/><div className="alrt-b"><strong>Waaree Energies concentration:</strong> 63.3% of top-10 supplier purchases in FY26 (₹182.7 Cr of ₹288.7 Cr). Any supply disruption directly impacts project delivery timelines and margins.</div></div>
       </div>
