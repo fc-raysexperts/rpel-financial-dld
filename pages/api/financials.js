@@ -52,9 +52,9 @@ export default async function handler(req, res) {
       fetch(`${base}/reports/profitandloss?from_date=${from}&to_date=${to}&cash_based=false`, { headers: zbH }),
       fetch(`${base}/reports/balancesheet?date=${to}&cash_based=false`, { headers: zbH }),
       fetch(`${base}/reports/cashflow?from_date=${from}&to_date=${to}`, { headers: zbH }),
-      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=25&sort_column=sales_amount&sort_order=D`, { headers: zbH }),
-      fetch(`${base}/reports/agedreceivables?date=${to}`, { headers: zbH }),
-      fetch(`${base}/reports/agedpayables?date=${to}`, { headers: zbH }),
+      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=25`, { headers: zbH }),
+      fetch(`${base}/reports/araging?from_date=${from}&to_date=${to}`, { headers: zbH }),
+      fetch(`${base}/reports/apaging?from_date=${from}&to_date=${to}`, { headers: zbH }),
     ]);
     [pl, bs, cf, cust, ar, ap] = await Promise.all([
       plR.json(), bsR.json(), cfR.json(), custR.json(), arR.json(), apR.json(),

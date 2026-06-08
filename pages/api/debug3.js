@@ -26,24 +26,20 @@ export default async function handler(req, res) {
   };
   const base = 'https://www.zohoapis.in/books/v3';
 
-  // Show full raw response + exact URL used for each endpoint
-  const custUrl = `${base}/reports/salesbycustomer?from_date=2026-04-01&to_date=2026-04-30&per_page=25&sort_column=sales_amount&sort_order=D`;
-  const arUrl   = `${base}/reports/agedreceivables?date=2026-04-30`;
-  const apUrl   = `${base}/reports/agedpayables?date=2026-04-30`;
+  const custUrl = `${base}/reports/salesbycustomer?from_date=2026-04-01&to_date=2026-04-30&per_page=25`;
+  const arUrl   = `${base}/reports/araging?from_date=2026-04-01&to_date=2026-04-30`;
+  const apUrl   = `${base}/reports/apaging?from_date=2026-04-01&to_date=2026-04-30`;
 
   const [custR, arR, apR] = await Promise.all([
-    fetch(custUrl,  { headers: zbH }),
-    fetch(arUrl,    { headers: zbH }),
-    fetch(apUrl,    { headers: zbH }),
+    fetch(custUrl, { headers: zbH }),
+    fetch(arUrl,   { headers: zbH }),
+    fetch(apUrl,   { headers: zbH }),
   ]);
-
-  const [cust, ar, ap] = await Promise.all([
-    custR.json(), arR.json(), apR.json()
-  ]);
+  const [cust, ar, ap] = await Promise.all([custR.json(), arR.json(), apR.json()]);
 
   return res.status(200).json({
-    cust: { url: custUrl, status: custR.status, raw: cust },
-    ar:   { url: arUrl,   status: arR.status,   raw: ar   },
-    ap:   { url: apUrl,   status: apR.status,   raw: ap   },
+    cust: { status: custR.status, keys: Object.keys(cust), first_row: (cust.sales_by_customer || cust.contact_receivables || Object.values(cust)[1] || [])[0] || cust },
+    ar:   { status: arR.status,   keys: Object.keys(ar),   first_row: (ar.ar_aging || ar.aged_receivables || ar.report_rows || Object.values(ar)[1] || [])[0] || ar },
+    ap:   { status: apR.status,   keys: Object.keys(ap),   first_row: (ap.ap_aging || ap.aged_payables || ap.report_rows || Object.values(ap)[1] || [])[0] || ap },
   });
 }
