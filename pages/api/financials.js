@@ -40,23 +40,22 @@ export default async function handler(req, res) {
     'X-com-zoho-books-organizationid': orgId,
   };
   const base = 'https://www.zohoapis.in/books/v3';
+  // All Zoho values are in rupees — divide by 1 crore
   const Cr = v => Math.round((parseFloat(v) || 0) / 10000000 * 100) / 100;
 
   // ── Step 2: Fetch all reports in parallel ─────────────────────────────────
-  let pl, bs, cf, cust, ar, ap;
+  let pl, bs, cf, cust, custBal;
   try {
-    const [plR, bsR, cfR, custR, arR, apR] = await Promise.all([
+    const [plR, bsR, cfR, custR, custBalR] = await Promise.all([
       fetch(`${base}/reports/profitandloss?from_date=${from}&to_date=${to}&cash_based=false`, { headers: zbH }),
       fetch(`${base}/reports/balancesheet?date=${to}&cash_based=false`, { headers: zbH }),
       fetch(`${base}/reports/cashflow?from_date=${from}&to_date=${to}`, { headers: zbH }),
-      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=25`, { headers: zbH }),
-      // AR aging: use receivablesummary instead
-      fetch(`${base}/reports/receivablesummary?from_date=${from}&to_date=${to}`, { headers: zbH }),
-      // AP aging: use payablesummary instead
-      fetch(`${base}/reports/payablesummary?from_date=${from}&to_date=${to}`, { headers: zbH }),
+      fetch(`${base}/reports/salesbycustomer?from_date=${from}&to_date=${to}&per_page=200`, { headers: zbH }),
+      // customerbalances: confirmed 200, has bcy_balance per customer
+      fetch(`${base}/reports/customerbalances?date=${to}&per_page=200`, { headers: zbH }),
     ]);
-    [pl, bs, cf, cust, ar, ap] = await Promise.all([
-      plR.json(), bsR.json(), cfR.json(), custR.json(), arR.json(), apR.json(),
+    [pl, bs, cf, cust, custBal] = await Promise.all([
+      plR.json(), bsR.json(), cfR.json(), custR.json(), custBalR.json(),
     ]);
   } catch (e) {
     return res.status(500).json({ ok: false, error: `ZB fetch failed: ${e.message}` });
@@ -65,9 +64,7 @@ export default async function handler(req, res) {
   // ── Step 3: Parse P&L ─────────────────────────────────────────────────────
   const plSections = pl.profit_and_loss || [];
   const plMap = {};
-  const plSectionMap = {};
   for (const section of plSections) {
-    plSectionMap[section.name] = section.total;
     for (const tx of section.account_transactions || []) {
       for (const item of tx.account_transactions || [tx]) {
         const key = (item.name || '').trim();
@@ -76,10 +73,10 @@ export default async function handler(req, res) {
     }
   }
 
-  const gpSection       = plSections.find(s => s.name === 'Gross Profit');
-  const opIncomeSection = (gpSection?.account_transactions || []).find(t => t.name === 'Operating Income');
-  const cogsSection     = (gpSection?.account_transactions || []).find(t => t.name === 'Cost of Goods Sold');
-  const opProfitSection = plSections.find(s => s.name === 'Operating Profit');
+  const gpSection        = plSections.find(s => s.name === 'Gross Profit');
+  const opIncomeSection  = (gpSection?.account_transactions || []).find(t => t.name === 'Operating Income');
+  const cogsSection      = (gpSection?.account_transactions || []).find(t => t.name === 'Cost of Goods Sold');
+  const opProfitSection  = plSections.find(s => s.name === 'Operating Profit');
   const netProfitSection = plSections.find(s => s.name === 'Net Profit/Loss');
 
   const rev      = Cr(opIncomeSection?.total || 0);
@@ -191,16 +188,22 @@ export default async function handler(req, res) {
   const begCF = getCF('beginning cash', 'opening balance');
   const endCF = getCF('ending cash', 'closing balance');
 
-  // ── Step 6: Parse Sales by Customer ───────────────────────────────────────
-  // debug3 showed: keys = ["code","message","sales","page_context"]
-  // so the array is under "sales" key
+  // ── Step 6: Build customer balance lookup map ─────────────────────────────
+  // customerbalances has bcy_balance per customer — positive = they owe us
+  const balMap = {};
+  for (const cb of (custBal.customerbalances || [])) {
+    const bal = parseFloat(cb.bcy_balance || 0);
+    if (bal > 0) balMap[cb.customer_id] = bal;
+  }
+
+  // ── Step 7: Parse Sales by Customer + merge outstanding ───────────────────
   const days = Math.max(1, Math.round((new Date(to) - new Date(from)) / 86400000));
-  const custRows = cust?.sales || cust?.sales_by_customer || cust?.report_rows || [];
+  const custRows = cust?.sales || [];
   const topClients = custRows
     .map(c => ({
-      nm:          c.customer_name || c.contact_name || c.name || 'Unknown',
+      nm:          c.customer_name || 'Unknown',
       billed:      Cr(c.sales || 0),
-      outstanding: Cr(c.outstanding_receivable_amount || c.balance || c.due_amount || 0),
+      outstanding: Cr(balMap[c.customer_id] || 0),
       sector:      '—',
       seg:         'epc',
     }))
@@ -211,24 +214,27 @@ export default async function handler(req, res) {
   const debtorDays = rev && days ? Math.round(rec / (rev / days)) : 0;
   const credDays   = cogs && days ? Math.round(tradePay / (cogs / days)) : 0;
 
-  // ── Step 7: AR/AP aging — derive from receivable/payable summary ──────────
-  // Since dedicated aging endpoints 404, derive buckets from summary data
-  // or return empty and show "not available" gracefully
-  const parseAgingFromSummary = (data) => {
-    const rows = data?.contact_receivables || data?.contact_payables ||
-                 data?.receivable_summary || data?.payable_summary ||
-                 data?.report_rows || [];
-    let b0=0, b1=0, b2=0, b3=0;
-    for (const r of (Array.isArray(rows) ? rows : [])) {
-      b0 += parseFloat(r.age_group_1 || r['0_30'] || 0);
-      b1 += parseFloat(r.age_group_2 || r['31_60'] || 0);
-      b2 += parseFloat(r.age_group_3 || r['61_90'] || 0);
-      b3 += parseFloat(r.age_group_4 || r['90_plus'] || r.above_90 || 0);
-    }
-    return { '0_30': Cr(b0), '31_60': Cr(b1), '61_90': Cr(b2), '90_plus': Cr(b3) };
+  // ── Step 8: AR aging from customerbalances ────────────────────────────────
+  // Zoho Books India API does not expose invoice-level aging buckets via REST.
+  // Best available: total outstanding from customerbalances = current receivables.
+  // We show total as 0–30 days (current) since we can't age without per-invoice calls.
+  const totalOutstanding = (custBal.customerbalances || [])
+    .reduce((sum, cb) => sum + Math.max(0, parseFloat(cb.bcy_balance || 0)), 0);
+  const arAging = {
+    '0_30':    Cr(totalOutstanding),
+    '31_60':   0,
+    '61_90':   0,
+    '90_plus': 0,
+    note:      'Total outstanding shown as current — invoice-level aging not available via Zoho API',
   };
-  const arAging = parseAgingFromSummary(ar);
-  const apAging = parseAgingFromSummary(ap);
+  // AP aging: use trade payables from BS as proxy
+  const apAging = {
+    '0_30':    tradePay,
+    '31_60':   0,
+    '61_90':   0,
+    '90_plus': 0,
+    note:      'Total payables shown as current — invoice-level aging not available via Zoho API',
+  };
 
   // ── Return ─────────────────────────────────────────────────────────────────
   return res.status(200).json({
